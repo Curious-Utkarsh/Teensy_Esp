@@ -7,9 +7,8 @@
 #define RX_PIN   16      // ESP32 RX1 (Not Used)
 #define SYNC_BYTE 0xAA   // Sync Byte to identify data packets
 
-#define InterruptPin 12
-
-volatile bool interruptFlag = false;
+#define valid_a  4
+#define cts_a    22
 
 // IIS3DWB Sensor Variables
 uint8_t Ascale = AFS_2G;
@@ -19,11 +18,12 @@ int16_t ax, ay, az;
 const float acc_mult_factor = 1000.0;
 IIS3DWB IIS3DWB(CSPIN);
 
-void IRAM_ATTR send_packet();
+unsigned int dt = 1000;
+unsigned long startTime;
 
 void setup() {
     Serial.begin(115200);   // Debugging
-    Serial1.begin(1500000, SERIAL_8N1, RX_PIN, TX_PIN);  // UART1 for Teensy
+    Serial2.begin(1500000, SERIAL_8N1, RX_PIN, TX_PIN);  // UART1 for Teensy
     SPI.begin(18, 19, 23, 5);  // SPI for IIS3DWB
 
     pinMode(CSPIN, OUTPUT);
@@ -39,33 +39,48 @@ void setup() {
         while (1); // Halt if sensor is not found
     }
 
-  pinMode(InterruptPin, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(InterruptPin), send_packet, RISING);
+  pinMode(valid_a, OUTPUT);
+  pinMode(cts_a, INPUT);
+
+  Serial.println("ESP Started...");
+  delay(2000);
 }
 
-void loop() {
-  if (interruptFlag) 
+void loop() 
+{
+  //Data Read from Sensor
+  if (IIS3DWB.DRstatus() & 0x01) 
   {
-    interruptFlag = false;  // Reset flag
-    if (IIS3DWB.DRstatus() & 0x01) {  // Check if new data is available
-        IIS3DWB.readAccelData(IIS3DWBData);
+    IIS3DWB.readAccelData(IIS3DWBData);
+    ax = acc_mult_factor * (IIS3DWBData[0] * aRes);
+    ay = acc_mult_factor * (IIS3DWBData[1] * aRes);
+    az = acc_mult_factor * (IIS3DWBData[2] * aRes);
+  }
 
-        ax = acc_mult_factor * (IIS3DWBData[0] * aRes);
-        ay = acc_mult_factor * (IIS3DWBData[1] * aRes);
-        az = acc_mult_factor * (IIS3DWBData[2] * aRes);
+  //Data Ready To Send
+  digitalWrite(valid_a, HIGH);
 
-        Serial1.write(SYNC_BYTE);          // Start frame
-        Serial1.write((uint8_t*)&ax, sizeof(ax));
-        Serial1.write((uint8_t*)&ay, sizeof(ay));
-        Serial1.write((uint8_t*)&az, sizeof(az));
-        //Serial.println(az);
+  //Waiting for CTS
+  startTime = micros();
+  while(digitalRead(cts_a) == 0)
+  {
+    if(micros()-startTime >= dt)
+    {
+      digitalWrite(valid_a, LOW);
+      return;
     }
   }
+
+  //CTS Recieved, Sendinhg Data
+  Serial2.write(SYNC_BYTE);          
+  Serial2.write((uint8_t*)&ax, sizeof(ax));
+  Serial2.write((uint8_t*)&ay, sizeof(ay));
+  Serial2.write((uint8_t*)&az, sizeof(az));
+
+  //Data Sent
+  digitalWrite(valid_a, LOW);
 }
 
-void IRAM_ATTR send_packet()
-{
-  interruptFlag = true;
-}
+
 
 
