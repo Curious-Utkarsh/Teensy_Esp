@@ -13,7 +13,7 @@ int16_t Gx, Gy, Gz;
 MPU9250_WE myMPU9250 = MPU9250_WE(&SPI, MPU_CS_PIN, true);  // Using VSPI
 
 unsigned long startTime = 0;
-unsigned long loopInterval = 40; // 1ms for 1kHz loop
+unsigned long loopInterval = 30; // 1ms for 1kHz loop
 
 void setup() {
   Serial.begin(115200);       // USB Serial for debugging
@@ -47,7 +47,12 @@ void loop()
     Gy = gyrValue.y;
     Gz = gyrValue.z;
 
-    byte sendData[8];
+    // Gx = (Gx > 4000)? 0 : ++Gx;
+    // Gy = (Gy > 5000)? 0 : ++Gy;
+    // Gz = (Gz > 6000)? 0 : ++Gz;
+
+
+    byte sendData[7];
     sendData[0] = SYNC_BYTE;
     memcpy(&sendData[1], &Gx, sizeof(Gx));  // Copy Gx to sendData
     memcpy(&sendData[3], &Gy, sizeof(Gy));  // Copy Gy to sendData

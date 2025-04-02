@@ -12,12 +12,12 @@
 uint8_t Ascale = AFS_2G;
 float aRes;
 int16_t IIS3DWBData[3] = {0};
-int16_t ax, ay, az;
+int16_t Ax, Ay, Az;
 const float acc_mult_factor = 1000.0;
 IIS3DWB IIS3DWB(CSPIN);
 
 unsigned long startTime = 0;
-unsigned long loopInterval = 40; // 1ms for 1kHz loop
+unsigned long loopInterval = 30; // 1ms for 1kHz loop
 
 void setup() {
     Serial.begin(115200);   // Debugging
@@ -49,16 +49,20 @@ void loop()
         // Data Read from Sensor
         if (IIS3DWB.DRstatus() & 0x01) {
             IIS3DWB.readAccelData(IIS3DWBData);
-            ax = acc_mult_factor * (IIS3DWBData[0] * aRes);
-            ay = acc_mult_factor * (IIS3DWBData[1] * aRes);
-            az = acc_mult_factor * (IIS3DWBData[2] * aRes);
+            Ax = acc_mult_factor * (IIS3DWBData[0] * aRes);
+            Ay = acc_mult_factor * (IIS3DWBData[1] * aRes);
+            Az = acc_mult_factor * (IIS3DWBData[2] * aRes);
         }
 
-        byte sendData[8];
+        // Ax = (Ax>4000)? 0 : ++Ax;
+        // Ay = (Ay>5000)? 0 : ++Ay;
+        // Az = (Az>6000)? 0 : ++Az;
+
+        byte sendData[7];
         sendData[0] = SYNC_BYTE;
-        memcpy(&sendData[1], &ax, sizeof(ax));  // Copy ax to sendData
-        memcpy(&sendData[3], &ay, sizeof(ay));  // Copy ay to sendData
-        memcpy(&sendData[5], &az, sizeof(az));  // Copy az to sendData
+        memcpy(&sendData[1], &Ax, sizeof(Ax));  // Copy ax to sendData
+        memcpy(&sendData[3], &Ay, sizeof(Ay));  // Copy ay to sendData
+        memcpy(&sendData[5], &Az, sizeof(Az));  // Copy az to sendData
 
         // Send all data in one go
         Serial2.write(sendData, sizeof(sendData));
