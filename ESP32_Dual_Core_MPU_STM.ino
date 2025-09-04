@@ -1,237 +1,221 @@
 /**
- * Core 0 Pipeline (IIS3DWB -> VSPI -> UART1):
- * - IIS3DWB CS    -> GPIO 5
- * - IIS3DWB MOSI  -> GPIO 23 (VSPI default)
- * - IIS3DWB MISO  -> GPIO 19 (VSPI default)
- * - IIS3DWB SCK   -> GPIO 18 (VSPI default)
- * - UART1 TX      -> GPIO 17 (Connect to your receiving device)
- *
- * Core 1 Pipeline (MPU9250 -> HSPI -> UART2):
- * - MPU9250 CS    -> GPIO 15
- * - MPU9250 MOSI  -> GPIO 13 (HSPI default)
- * - MPU9250 MISO  -> GPIO 12 (HSPI default)
- * - MPU9250 SCK   -> GPIO 14 (HSPI default)
+ * Core 0: IIS3DWB -> VSPI -> UART1 (TX=GPIO17)
+ * Core 1: MPU9250 -> HSPI -> USB Serial0
  */
 
-// --- LIBRARIES ---
 #include <Arduino.h>
 #include <SPI.h>
-#include "IIS3DWB.h"      // Library for the IIS3DWB sensor
-#include <MPU9250_WE.h>   // Library for the MPU9250 sensor
-#include "esp_task_wdt.h" // For watchdog timer control
+#include "IIS3DWB.h"
+#include <MPU9250_WE.h>
+#include "esp_task_wdt.h"
 
-// --- GLOBAL CONFIGURATION ---
-#define SERIAL_DEBUG true // Set to true to get diagnostic output on the USB Serial Monitor
+// -------------------- CONFIG --------------------
+#define SERIAL_DEBUG false
 
-// --- CORE 0: IIS3DWB SENSOR (ON VSPI BUS) ---
-#define VSPI_CS_PIN 5
+// VSPI (IIS3DWB)
+#define VSPI_CS_PIN   5
 #define VSPI_MOSI_PIN 23
 #define VSPI_MISO_PIN 19
-#define VSPI_SCK_PIN 18
-#define UART1_TX_PIN 17
+#define VSPI_SCK_PIN  18
+#define UART1_TX_PIN  17
 
-// Instantiate IIS3DWB class. This library uses the default global SPI instance.
-// We will ensure the global SPI is configured for VSPI within Core 0's task.
-IIS3DWB iis3dwb(VSPI_CS_PIN);
-
-// IIS3DWB sensor settings
-const uint8_t Ascale = AFS_2G; // Accelerometer Full Scale (AFS_2G, AFS_4G, AFS_8G, AFS_16G)
-float aRes;                    // Scale resolution per LSB
-float accelBias[3] = {0.0f, 0.0f, 0.0f}; // Offset biases
-int16_t iis3dwbData[3] = {0};            // Raw sensor data
-const float ACC_MULT_FACTOR = 1000.0;    // Conversion to milli-g's
-int16_t garbageValue = -5000;
-
-// --- CORE 1: MPU9250 SENSOR (ON HSPI BUS) ---
-#define HSPI_CS_PIN 15
+// HSPI (MPU9250)
+#define HSPI_CS_PIN   15
 #define HSPI_MOSI_PIN 13
 #define HSPI_MISO_PIN 12
-#define HSPI_SCK_PIN 14
+#define HSPI_SCK_PIN  14
 
-// Create a dedicated SPIClass instance for the HSPI bus
+// Packet sync
+const uint8_t SYNC_BYTE = 0xAA;
+
+// IIS3DWB config/state
+IIS3DWB iis3dwb(VSPI_CS_PIN);
+const uint8_t Ascale = AFS_2G;
+float aRes = 0.0f;
+float accelBias[3] = {0.0f, 0.0f, 0.0f};
+int16_t iis3dwbData[3] = {0};
+const float ACC_MULT_FACTOR = 1000.0f;
+int16_t garbageValue = -5000;
+
+// HSPI bus + MPU9250
 SPIClass hspi(HSPI);
-
-// Instantiate MPU9250 class, passing the HSPI instance to the constructor
 MPU9250_WE myMPU9250 = MPU9250_WE(&hspi, HSPI_CS_PIN, HSPI_MOSI_PIN, HSPI_MISO_PIN, HSPI_SCK_PIN, true);
 
-// MPU9250 data variables
-const int8_t SYNC_BYTE = 0xAA;
-int16_t gx, gy, gz;
-
-// --- TASK HANDLES ---
+// -------------------- RTOS HANDLES --------------------
 TaskHandle_t taskIIS_Core0;
 TaskHandle_t taskMPU_Core1;
 
+// Mutexes (for race-free access)
+SemaphoreHandle_t serial0Mutex;  // USB Serial
+SemaphoreHandle_t serial1Mutex;  // UART1
+SemaphoreHandle_t vspiMutex;     // VSPI bus
+SemaphoreHandle_t hspiMutex;     // HSPI bus
 
-//================================================================================
-//                            TASK FOR CORE 0: IIS3DWB
-//================================================================================
+// Helper macros
+#define LOCK(m)   xSemaphoreTake((m), portMAX_DELAY)
+#define UNLOCK(m) xSemaphoreGive((m))
+
+// ================= CORE 0: IIS3DWB TASK =================
 void taskIIS(void *pvParameters) {
-  if (SERIAL_DEBUG) {
-    Serial.print("Task for IIS3DWB is running on core ");
-    Serial.println(xPortGetCoreID());
-  }
+  if (SERIAL_DEBUG) { LOCK(serial0Mutex); Serial.printf("IIS3DWB task on core %d\n", xPortGetCoreID()); UNLOCK(serial0Mutex); }
 
-  // --- INITIALIZE HARDWARE FOR THIS CORE ---
-  // Initialize the default SPI bus (VSPI) with its specific pins.
-  // The IIS3DWB library uses this global SPI object implicitly.
+  // Init VSPI (global SPI)
   SPI.begin(VSPI_SCK_PIN, VSPI_MISO_PIN, VSPI_MOSI_PIN);
   pinMode(VSPI_CS_PIN, OUTPUT);
   digitalWrite(VSPI_CS_PIN, HIGH);
 
-  // --- SENSOR SETUP ---
+  // Sensor init — protect VSPI access
+  LOCK(vspiMutex);
   iis3dwb.reset();
+  UNLOCK(vspiMutex);
   delay(100);
 
-  // Check communication
-  uint8_t chipID = iis3dwb.getChipID();
+  uint8_t chipID;
+  LOCK(vspiMutex);
+  chipID = iis3dwb.getChipID();
+  UNLOCK(vspiMutex);
+
   if (chipID == 0x7B) {
-    if (SERIAL_DEBUG) Serial.println("Core 0: IIS3DWB connection successful.");
+    if (SERIAL_DEBUG) { LOCK(serial0Mutex); Serial.println("Core0: IIS3DWB OK"); UNLOCK(serial0Mutex); }
+    LOCK(vspiMutex);
     aRes = iis3dwb.getAres(Ascale);
     iis3dwb.init(Ascale);
     iis3dwb.offsetBias(accelBias);
+    UNLOCK(vspiMutex);
   } else {
-    if (SERIAL_DEBUG) {
-      Serial.print("Core 0: Error, IIS3DWB not found! Chip ID: 0x");
-      Serial.println(chipID, HEX);
-    }
+    if (SERIAL_DEBUG) { LOCK(serial0Mutex); Serial.printf("Core0: IIS3DWB not found (0x%02X)\n", chipID); UNLOCK(serial0Mutex); }
   }
 
-  // --- TASK LOOP ---
+  // Loop
   for (;;) {
-    // Check if the sensor reported a successful connection
-    if (chipID == 0x7B) {
-      // Check if new data is available
-      if (iis3dwb.DRstatus() & 0x01) {
-        iis3dwb.readAccelData(iis3dwbData);
+    uint8_t packet[7]; // [SYNC][ax][ay][az]
+    packet[0] = SYNC_BYTE;
 
-        // Calculate acceleration in milli-g's
+    if (chipID == 0x7B) {
+      // Read data (guard VSPI + sensor lib)
+      bool haveData = false;
+      LOCK(vspiMutex);
+      uint8_t dr = iis3dwb.DRstatus();
+      if (dr & 0x01) {
+        iis3dwb.readAccelData(iis3dwbData);
+        haveData = true;
+      }
+      UNLOCK(vspiMutex);
+
+      if (haveData) {
         int16_t ax = ACC_MULT_FACTOR * ((float)iis3dwbData[0] * aRes - accelBias[0]);
         int16_t ay = ACC_MULT_FACTOR * ((float)iis3dwbData[1] * aRes - accelBias[1]);
         int16_t az = ACC_MULT_FACTOR * ((float)iis3dwbData[2] * aRes - accelBias[2]);
 
-        // Send data over UART1 in binary format
-        Serial1.write(SYNC_BYTE);
-        
-        Serial1.write((uint8_t *)&ax, sizeof(ax));
-        Serial1.write((uint8_t *)&ay, sizeof(ay));
-        Serial1.write((uint8_t *)&az, sizeof(az));
+        memcpy(&packet[1], &ax, 2);
+        memcpy(&packet[3], &ay, 2);
+        memcpy(&packet[5], &az, 2);
+
+        // UART1 write is not shared, but still protect for safety
+        LOCK(serial1Mutex);
+        if (Serial1.availableForWrite() >= sizeof(packet)) {
+            Serial1.write(packet, sizeof(packet));
+        }
+        UNLOCK(serial1Mutex);
       }
     } else {
-      // Send garbage data if the sensor was never detected
-      Serial1.write(SYNC_BYTE);
-      Serial1.write((uint8_t *)&garbageValue, sizeof(garbageValue));
-      Serial1.write((uint8_t *)&garbageValue, sizeof(garbageValue));
-      Serial1.write((uint8_t *)&garbageValue, sizeof(garbageValue));
+      memcpy(&packet[1], &garbageValue, 2);
+      memcpy(&packet[3], &garbageValue, 2);
+      memcpy(&packet[5], &garbageValue, 2);
+      LOCK(serial1Mutex);
+      if (Serial1.availableForWrite() >= sizeof(packet)) {
+          Serial1.write(packet, sizeof(packet));
+      }
+      UNLOCK(serial1Mutex);
     }
-    
-    // Give the scheduler time to run other tasks.
-    // The IIS3DWB has a max ODR of 26.7kHz. A small delay is fine.
-    vTaskDelay(1); 
-    // taskYIELD();
 
+    // Optional: cooperate without adding fixed latency
+    taskYIELD();
   }
 }
 
-//================================================================================
-//                            TASK FOR CORE 1: MPU9250
-//================================================================================
+// ================= CORE 1: MPU9250 TASK =================
 void taskMPU(void *pvParameters) {
-  if (SERIAL_DEBUG) {
-    Serial.print("Task for MPU9250 is running on core ");
-    Serial.println(xPortGetCoreID());
-  }
-  
-  // --- INITIALIZE HARDWARE FOR THIS CORE ---
-  // The HSPI pins and CS are already configured in the MPU9250_WE constructor.
-  // We just need to call hspi.begin() here.
+  if (SERIAL_DEBUG) { LOCK(serial0Mutex); Serial.printf("MPU9250 task on core %d\n", xPortGetCoreID()); UNLOCK(serial0Mutex); }
+
+  // Avoid WDT during long init
+  esp_task_wdt_delete(NULL);
+
+  // Init HSPI
   hspi.begin(HSPI_SCK_PIN, HSPI_MISO_PIN, HSPI_MOSI_PIN, HSPI_CS_PIN);
   pinMode(HSPI_CS_PIN, OUTPUT);
-  
-  // --- SENSOR SETUP ---
-  // Disable watchdog timer as auto-offset calibration can be slow
-  esp_task_wdt_delete(NULL); 
-  
-  if (SERIAL_DEBUG) Serial.println("Core 1: Initializing MPU9250...");
-  
-  myMPU9250.init();
-  delay(2000);
-  if (SERIAL_DEBUG) Serial.println("Core 1: Calibrating MPU9250 offsets...");
+
+  // Sensor init guarded by HSPI mutex
+  LOCK(hspiMutex);
+  bool ok = myMPU9250.init();
+  UNLOCK(hspiMutex);
+
+  if (!ok) {
+    if (SERIAL_DEBUG) {LOCK(serial0Mutex); Serial.println("Core1: MPU9250 not found"); UNLOCK(serial0Mutex);}
+    vTaskDelete(NULL);
+  }
+
+  if (SERIAL_DEBUG) { LOCK(serial0Mutex); Serial.println("Core1: MPU9250 init..."); UNLOCK(serial0Mutex);}
+
+  LOCK(hspiMutex);
   myMPU9250.autoOffsets();
-  if (SERIAL_DEBUG) Serial.println("Core 1: MPU9250 calibration complete.");
-  
   myMPU9250.disableGyrDLPF(MPU9250_BW_WO_DLPF_8800);
   myMPU9250.setGyrRange(MPU9250_GYRO_RANGE_250);
   myMPU9250.setAccRange(MPU9250_ACC_RANGE_4G);
   myMPU9250.enableAccDLPF(false);
   myMPU9250.setAccDLPF(MPU9250_DLPF_6);
   myMPU9250.setMagOpMode(AK8963_CONT_MODE_100HZ);
-  delay(1000);
+  UNLOCK(hspiMutex);
 
-  // --- TASK LOOP ---
+  // Loop
   for (;;) {
-    xyzFloat gyr = myMPU9250.getGyrRawValues();
+    xyzFloat gyr;
+    LOCK(hspiMutex);
+    gyr = myMPU9250.getGyrRawValues();
+    UNLOCK(hspiMutex);
 
-    gx = gyr.x;
-    gy = gyr.y;
-    gz = gyr.z;
+    int16_t gx = (int16_t)gyr.x;
+    int16_t gy = (int16_t)gyr.y;
+    int16_t gz = (int16_t)gyr.z;
 
-    // Send data over UART2 in binary format
-    Serial.write(SYNC_BYTE);
-    Serial.write((uint8_t *)&gx, sizeof(gx));
-    Serial.write((uint8_t *)&gy, sizeof(gy));
-    Serial.write((uint8_t *)&gz, sizeof(gz));
+    uint8_t packet[7]; // [SYNC][gx][gy][gz]
+    packet[0] = SYNC_BYTE;
+    memcpy(&packet[1], &gx, 2);
+    memcpy(&packet[3], &gy, 2);
+    memcpy(&packet[5], &gz, 2);
 
-    // A small delay to prevent this task from hogging the core completely
-    vTaskDelay(1); 
-    // taskYIELD();
+    // USB Serial is shared with debug prints → protect
+    LOCK(serial0Mutex);
+    if (Serial.availableForWrite() >= sizeof(packet)) {
+        Serial.write(packet, sizeof(packet));
+    }
+    UNLOCK(serial0Mutex);
+
+    taskYIELD();
   }
 }
 
-
-//================================================================================
-//                                  SETUP
-//================================================================================
+// ========================== SETUP ==========================
 void setup() {
-  // Initialize Serial Monitor for debugging
+  // Create mutexes BEFORE any task starts
+  serial0Mutex = xSemaphoreCreateMutex();
+  serial1Mutex = xSemaphoreCreateMutex();
+  vspiMutex    = xSemaphoreCreateMutex();
+  hspiMutex    = xSemaphoreCreateMutex();
+
+
+  // Start serials
   Serial.begin(1500000);
-  delay(2000);
-  if (SERIAL_DEBUG) Serial.println("--- Dual Core Sensor Demo ---");
+  Serial1.begin(1500000, SERIAL_8N1, -1, UART1_TX_PIN);
 
-  // Initialize the two data UARTs with their respective TX pins
-  Serial1.begin(1500000, SERIAL_8N1, -1, UART1_TX_PIN); // RX pin -1 (unused)
+  if (SERIAL_DEBUG) { LOCK(serial0Mutex); Serial.println("--- Dual Core (Race-Safe) ---"); UNLOCK(serial0Mutex); }
 
-  hspi.begin();
-  pinMode(HSPI_CS_PIN, OUTPUT);
-
-  // Create the IIS3DWB task and pin it to Core 0
-  xTaskCreatePinnedToCore(
-      taskIIS,      // Function to implement the task
-      "IIS_Task",   // Name of the task
-      10000,        // Stack size in words
-      NULL,         // Task input parameter
-      1,            // Priority of the task (1 is low)
-      &taskIIS_Core0, // Task handle
-      0);           // Pin task to Core 0
-
-  // Create the MPU9250 task and pin it to Core 1
-  xTaskCreatePinnedToCore(
-      taskMPU,      // Function to implement the task
-      "MPU_Task",   // Name of the task
-      10000,        // Stack size in words
-      NULL,         // Task input parameter
-      1,            // Priority of the task
-      &taskMPU_Core1, // Task handle
-      1);           // Pin task to Core 1
-
-  if (SERIAL_DEBUG) Serial.println("Setup complete. Tasks are running.");
+  // Create tasks pinned to different cores
+  xTaskCreatePinnedToCore(taskIIS, "IIS_Task", 10000, NULL, 2, &taskIIS_Core0, 0);
+  xTaskCreatePinnedToCore(taskMPU, "MPU_Task", 10000, NULL, 2, &taskMPU_Core1, 1);
 }
 
-//================================================================================
-//                                   LOOP
-//================================================================================
 void loop() {
-  // The main loop() runs on Core 1 by default, but our tasks handle all the work.
-  // This can be left empty or used for low-priority, non-blocking code.
-  delay(1000);
+  // Idle — all work handled in tasks
+  //delay(1000);
 }
